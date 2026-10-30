@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-text-scrubber
 A command-line tool that removes or replaces sensitive information (e.g., email addresses, phone numbers, dates, common PII patterns) from text files. Utilizes regular expressions for pattern matching, allowing customizable patterns. Operates on standard input/output or file-based input/output. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats, preparing datasets for testing or secure sharing.
 
