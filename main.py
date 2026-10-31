@@ -78,43 +78,46 @@ def apply_regex_replacement(text: str, pattern: Pattern, replacement_func: Calla
     return text # Return original text if error occurs
 
 
-def sanitize_text(text: str, patterns: List[str], replacement_type: str, custom_replacement: Optional[str] = None) -> str:
-    """Sanitizes the given text based on the provided patterns and replacement type."""
-    
+DEFAULT_PATTERN_TYPES = {}
+
+def sanitize_text(text: str, patterns: List[str], replacement_type: str, custom_replacement: Optional[str] = None, pattern_types: Optional[dict] = None):
+    """Sanitizes text. Returns (sanitized_text, match_count). Patterns are compiled
+    by the caller at startup; an invalid pattern fails the run before this is called."""
+    if replacement_type == 'custom' and not custom_replacement:
+        logging.error(f"Custom replacement required but not provided for pattern: {patterns[0] if patterns else ''}")
+        sys.exit(1)
     sanitized_text = text
-    
-    if not patterns:
-      logging.warning("No patterns provided for sanitization, returning original text.")
-      return text
-
+    total = 0
+    types_map = pattern_types or {}
     for pattern_str in patterns:
-        try:
-            pattern = re.compile(pattern_str)
-        except re.error as e:
-            logging.error(f"Invalid regex pattern: {pattern_str} - {e}")
-            continue # Skip invalid patterns
-
+        pattern = re.compile(pattern_str)
+        count = len(pattern.findall(sanitized_text))
+        total += count
+        if count == 0:
+            continue
+        data_type = types_map.get(pattern_str, 'word')
         if replacement_type == 'remove':
           sanitized_text = apply_regex_replacement(sanitized_text, pattern, replace_match, replacement="")
         elif replacement_type == 'fake':
-          sanitized_text = apply_regex_replacement(sanitized_text, pattern, lambda match, data_type: generate_fake_data(data_type) ,data_type=pattern_str)
+          sanitized_text = apply_regex_replacement(sanitized_text, pattern, lambda match, data_type=data_type: generate_fake_data(data_type))
         elif replacement_type == 'custom':
-          if not custom_replacement:
-            logging.error("Custom replacement required but not provided for pattern: {pattern_str}")
-            continue
           sanitized_text = apply_regex_replacement(sanitized_text, pattern, replace_match, replacement=custom_replacement)
         else:
             logging.error(f"Invalid replacement type: {replacement_type} - pattern: {pattern_str}")
-    
-    return sanitized_text
+            sys.exit(1)
+    return sanitized_text, total
 
 def setup_argparse() -> argparse.ArgumentParser:
     """Sets up the command-line argument parser."""
     parser = argparse.ArgumentParser(description='Sanitize sensitive information from text files.')
     parser.add_argument('-i', '--input', type=str, help='Input file path, use - for stdin', default=None)
     parser.add_argument('-o', '--output', type=str, help='Output file path, use - for stdout', default=None)
-    parser.add_argument('-p', '--patterns', type=str, nargs='+', help='Regex patterns for sensitive data.', default=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b',
-            r'\d{3}-\d{3}-\d{4}', r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}', r'\b[A-Z][a-z]+\s[A-Z][a-z]+\b']) # Default Patterns (email, phone, date, name)
+    _name_pat = r'\b(?!(?:The|A|An|This|That|These|Those|My|His|Her|Their|Our|Your)\s)[A-Z][a-z]+\s[A-Z][a-z]+\b'
+    _defaults = [r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b',
+            r'\d{3}-\d{3}-\d{4}', r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}', _name_pat]
+    _types = {_defaults[0]: 'email', _defaults[1]: 'phone', _defaults[2]: 'date', _defaults[3]: 'name'}
+    parser.add_argument('-p', '--patterns', type=str, nargs='+', help='Regex patterns for sensitive data.', default=_defaults)
+    parser.set_defaults(_pattern_types=_types)
     parser.add_argument('-r', '--replacement', type=str, choices=['remove', 'fake', 'custom'], default='remove', help='Replacement type (remove, fake, custom).')
     parser.add_argument('-c', '--custom-replacement', type=str, help='Custom replacement string if replacement type is "custom".')
     parser.add_argument('--version', action='version', version='%(prog)s 1.0.0')
@@ -124,6 +127,36 @@ def main() -> None:
     """Main function to parse arguments, sanitize text, and handle I/O."""
     parser = setup_argparse()
     args = parser.parse_args()
+
+    # Custom mode requires a replacement string.
+    if args.replacement == 'custom' and not args.custom_replacement:
+        logging.error(f"Custom replacement required but not provided for pattern: {args.patterns[0] if args.patterns else ''}")
+        sys.exit(1)
+    # Compile every pattern at startup; any failure exits before output is opened.
+    for _pat in (args.patterns or []):
+        try:
+            re.compile(_pat)
+        except re.error as e:
+            logging.error(f"Invalid regex pattern: {_pat} - {e}")
+            sys.exit(1)
+    if not args.patterns:
+        print("No patterns provided. Nothing scrubbed.")
+        sys.exit(1)
+    # Same-path guard: resolved output must not equal the input file.
+    if args.input and args.input != '-' and args.output and args.output != '-':
+        try:
+            if os.path.realpath(args.input) == os.path.realpath(args.output) or os.path.abspath(args.input) == os.path.abspath(args.output):
+                logging.error("Output path resolves to the input file. Refusing to overwrite the input.")
+                sys.exit(1)
+            # realpath resolves symlinks and ./ aliases; also compare resolved Paths
+            from pathlib import Path as _P
+            if _P(args.input).resolve() == _P(args.output).resolve():
+                logging.error("Output path resolves to the input file. Refusing to overwrite the input.")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
 
     if args.input == '-':
         if sys.stdin.isatty():
@@ -140,7 +173,23 @@ def main() -> None:
         sys.exit(1)
 
 
-    sanitized_text = sanitize_text(text, args.patterns, args.replacement, args.custom_replacement)
+    _known_types = {
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b': 'email',
+        r'\d{3}-\d{3}-\d{4}': 'phone',
+        r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}': 'date',
+    }
+    for _k, _v in list(_known_types.items()):
+        pass
+    # name pattern is the remaining default pattern (the guarded Title Case pair)
+    _pattern_types = dict(_known_types)
+    for _pat in args.patterns:
+        if _pat not in _pattern_types:
+            _pattern_types[_pat] = 'name' if ('[A-Z]' in _pat and '[a-z]' in _pat) else 'word'
+    sanitized_text, match_count = sanitize_text(text, args.patterns, args.replacement, args.custom_replacement, pattern_types=_pattern_types)
+    logging.info(f"Scrubbed {match_count} value(s).")
+    if match_count == 0:
+        print("No values scrubbed.")
+        sys.exit(1)
 
     if args.output == '-':
         print(sanitized_text)
