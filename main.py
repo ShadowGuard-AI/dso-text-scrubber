@@ -11,6 +11,10 @@ import os
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Detection here never fails the run. Any error, or a no-answer from
+# chardet, lands on utf-8. Note the write side defaults to utf-8 too, so a
+# file detected as something else is read in that encoding but written
+# back as utf-8.
 def detect_encoding(file_path: str) -> str:
     """Detects the encoding of a text file."""
     try:
@@ -53,6 +57,9 @@ def replace_match(match: re.Match, replacement: str) -> str:
 
 def generate_fake_data(data_type: str) -> str:
   """Generate fake data based on the data type."""
+  # A fresh Faker for every single match. That is slow on a large file and
+  # none of the fakes share state, but it keeps this helper stateless, and
+  # correctness never depended on the generator's sequence.
   fake = Faker()
   if data_type == 'email':
       return fake.email()
@@ -91,6 +98,9 @@ def sanitize_text(text: str, patterns: List[str], replacement_type: str, custom_
     types_map = pattern_types or {}
     for pattern_str in patterns:
         pattern = re.compile(pattern_str)
+        # I count on the text as it stands before this pattern runs. Patterns run
+        # in order over each other's output, so a later pattern can match text an
+        # earlier replacement introduced, and its count includes those matches.
         count = len(pattern.findall(sanitized_text))
         total += count
         if count == 0:
@@ -99,6 +109,9 @@ def sanitize_text(text: str, patterns: List[str], replacement_type: str, custom_
         if replacement_type == 'remove':
           sanitized_text = apply_regex_replacement(sanitized_text, pattern, replace_match, replacement="")
         elif replacement_type == 'fake':
+          # data_type is bound as a default argument on purpose. Without that, the
+          # lambda would read the loop variable late and every match in this pass
+          # would be replaced using the last pattern's type.
           sanitized_text = apply_regex_replacement(sanitized_text, pattern, lambda match, data_type=data_type: generate_fake_data(data_type))
         elif replacement_type == 'custom':
           sanitized_text = apply_regex_replacement(sanitized_text, pattern, replace_match, replacement=custom_replacement)
@@ -112,6 +125,10 @@ def setup_argparse() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Sanitize sensitive information from text files.')
     parser.add_argument('-i', '--input', type=str, help='Input file path, use - for stdin', default=None)
     parser.add_argument('-o', '--output', type=str, help='Output file path, use - for stdout', default=None)
+    # The name pattern is a guarded guess: two Title Case words, minus the
+    # ones that commonly start a sentence. It will still catch real sentence
+    # starts it does not know, and miss names with lowercase particles. I keep
+    # it because a name is the one default type with no fixed shape to match.
     _name_pat = r'\b(?!(?:The|A|An|This|That|These|Those|My|His|Her|Their|Our|Your)\s)[A-Z][a-z]+\s[A-Z][a-z]+\b'
     _defaults = [r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b',
             r'\d{3}-\d{3}-\d{4}', r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}', _name_pat]
@@ -159,6 +176,8 @@ def main() -> None:
             pass
 
     if args.input == '-':
+        # Reading stdin from a terminal would block waiting for input that the
+        # user does not know the tool wants. I refuse instead of hanging.
         if sys.stdin.isatty():
           logging.error("No input provided via stdin.")
           sys.exit(1)
@@ -182,7 +201,14 @@ def main() -> None:
         pass
     # name pattern is the remaining default pattern (the guarded Title Case pair)
     _pattern_types = dict(_known_types)
+    # Main rebuilds the pattern type map below and never reads the one stored
+    # by set_defaults in setup_argparse. The stored map is dead weight left
+    # from an earlier shape of this code, noted here instead of removed,
+    # because this pass changes comments only.
     for _pat in args.patterns:
+        # A custom pattern gets its fake data type guessed from its shape: it
+        # mentions both cases, so I call it a name, otherwise a plain word. The
+        # guess only matters in fake mode; remove and custom ignore the type.
         if _pat not in _pattern_types:
             _pattern_types[_pat] = 'name' if ('[A-Z]' in _pat and '[a-z]' in _pat) else 'word'
     sanitized_text, match_count = sanitize_text(text, args.patterns, args.replacement, args.custom_replacement, pattern_types=_pattern_types)
